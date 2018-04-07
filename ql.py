@@ -3,10 +3,12 @@
 from ple.games.pixelcopter import Pixelcopter
 from ple import PLE
 import numpy as np
-#import random
+import random
 import pygame
+import json
 from skimage import transform,exposure
 from collections import deque
+import tensorflow as tf
 
 from keras.models import Sequential
 from keras.layers.core import Dense, Activation, Flatten
@@ -19,6 +21,16 @@ from keras.optimizers import Adam
 OBSERVATION = 3200 # timesteps to observe before training
 INITIAL_EPSILON = 0.1 # starting value of epsilon
 FINAL_EPSILON = 0.0001 # final value of epsilon
+num_actions = 2 
+FRAME_PER_ACTION = 1
+EXPLORE = 3000000. # frames over which to reduce epsilon
+REPLAY_MEMORY = 50000 # number of previous transitions to remember
+BATCH = 32 # size of minibatch
+GAMMA = 0.99 # decay rate of past observations
+img_rows , img_cols = 80, 80
+img_channels = 4 #We stack 4 frames
+
+
 
 class Bot():
     """
@@ -35,7 +47,7 @@ class Bot():
     #def pickAction(self, reward, obs):
      #   return random.choice(self.actions)
 
-    def frame_step(act_inp):
+    def frame_step(self,act_inp):
         terminal=False
         reward = self.p.act(act_inp)
         if self.p.game_over():
@@ -45,10 +57,11 @@ class Bot():
         else:
             reward = 1
         
-        self.score = self.p.getScore()
+        self.score = self.p.score()
         img = self.p.getScreenGrayscale()
         img = transform.resize(img,(80,80))
-        img = np.ravel(exposure.rescale_intensity(img, out_range=(0, 255)))
+        img = exposure.rescale_intensity(img, out_range=(0, 255))
+        img = img/255.0
         
         return img,reward, terminal
     
@@ -75,8 +88,7 @@ class Bot():
     def trainNetwork(self,mode):
         D = deque()
         
-        x_t, r_0, terminal = self.frame_step(self.actions[0])
-        x_t = x_t / 255.0
+        x_t, r_0, terminal = self.frame_step(self.actions[1])
 
         s_t = np.stack((x_t, x_t, x_t, x_t), axis=2)
         #print (s_t.shape)
@@ -95,46 +107,130 @@ class Bot():
         else:                       #We go to training mode
             OBSERVE = OBSERVATION
             epsilon = INITIAL_EPSILON
-
+        
+        t = 0
+        while (True):
+            loss = 0
+            Q_sa = 0
+            action_index = 0
+            r_t = 0
+            #choose an action epsilon greedy
+            if t % FRAME_PER_ACTION == 0:
+                if random.random() <= epsilon:
+                    print("----------Random Action----------")
+                    action_index = random.randrange(num_actions)
+                    chosen_act = self.actions[action_index]
+                else:
+                    q = self.model.predict(s_t)       #input a stack of 4 images, get the prediction
+                    max_Q = np.argmax(q)
+                    action_index = max_Q
+                    chosen_act = self.actions[action_index]
+    
+            #We reduced the epsilon gradually
+            if epsilon > FINAL_EPSILON and t > OBSERVE:
+                epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORE
+    
+            #run the selected action and observed next state and reward
+            x_t1, r_t, terminal = self.frame_step(chosen_act)
+    
+            x_t1 = x_t1.reshape(1, x_t1.shape[0], x_t1.shape[1], 1) #1x80x80x1
+            s_t1 = np.append(x_t1, s_t[:, :, :, :3], axis=3)
+    
+            # store the transition in D
+            D.append((s_t, action_index, r_t, s_t1, terminal))
+            if len(D) > REPLAY_MEMORY:
+                D.popleft()
+    
+            #only train if done observing
+            if t > OBSERVE:
+                #sample a minibatch to train on
+                minibatch = random.sample(D, BATCH)
+    
+                #Now we do the experience replay
+                state_t, action_t, reward_t, state_t1, terminal = zip(*minibatch)
+                state_t = np.concatenate(state_t)
+                state_t1 = np.concatenate(state_t1)
+                targets = self.model.predict(state_t)
+                Q_sa = self.model.predict(state_t1)
+                targets[range(BATCH), action_t] = reward_t + GAMMA*np.max(Q_sa, axis=1)*np.invert(terminal)
+    
+                loss += self.model.train_on_batch(state_t, targets)
+    
+            s_t = s_t1
+            t = t + 1
+    
+            # save progress every 10000 iterations
+            if t % 1000 == 0:
+                print("Now we save model")
+                self.model.save_weights("model.h5", overwrite=True)
+                with open("model.json", "w") as outfile:
+                    json.dump(self.model.to_json(), outfile)
+    
+            # print info
+            state = ""
+            if t <= OBSERVE:
+                state = "observe"
+            elif t > OBSERVE and t <= OBSERVE + EXPLORE:
+                state = "explore"
+            else:
+                state = "train"
+    
+            print("TIMESTEP", t, "/ STATE", state, \
+                "/ EPSILON", epsilon, "/ ACTION", action_index, "/ REWARD", r_t, \
+                "/ Q_MAX " , np.max(Q_sa), "/ Loss ", loss)
+    
+        print("Episode finished!")
+        print("************************")
+        
+    def playGame(self,mode):
+        self.build_model()
+        self.trainNetwork(mode)
+    
+    def main(self):
+        modes = ["Train","Run"]
+        mode = modes[input("Do you wanna Train(0) or Run(1): ")]
+        self.playGame(mode)
         
         
-        
-        
-        
-img_rows , img_cols = 80, 80
-img_channels = 4 #We stack 4 frames
 lr = 0.01
 
+if __name__ == "__main__":
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    sess = tf.Session(config=config)
+    from keras import backend as K
+    K.set_session(sess)
+    
+    b1 = Bot(lr)
+    b1.main()
+    pygame.quit()
 
-
-
-reward = 0.0
-
-i_size = 0
-in_arr = []
-temp_in = []
-for i in range(100): #no of frames
-   if p.game_over():
-           p.reset_game()
-   if i_size == 3:
-       #print (temp_in.shape)
-       in_arr.append(temp_in)
-       temp_in = []
-       
-   else:
-        img = p.getScreenGrayscale()
-        img = transform.resize(img,(80,80))
-        img = np.ravel(exposure.rescale_intensity(img, out_range=(0, 255)))
-        #print (img.shape)
-        temp_in.append(img)
-        
-   observation = p.getScreenRGB()
-   action = agent.pickAction(reward, observation)
-   reward = p.act(action)
-   
+#==============================================================================
+# reward = 0.0
+# 
+# i_size = 0
+# in_arr = []
+# temp_in = []
+# for i in range(100): #no of frames
+#    if p.game_over():
+#            p.reset_game()
+#    if i_size == 3:
+#        #print (temp_in.shape)
+#        in_arr.append(temp_in)
+#        temp_in = []
+#        
+#    else:
+#         img = p.getScreenGrayscale()
+#         img = transform.resize(img,(80,80))
+#         img = np.ravel(exposure.rescale_intensity(img, out_range=(0, 255)))
+#         #print (img.shape)
+#         temp_in.append(img)
+#         
+#    observation = p.getScreenRGB()
+#    action = agent.pickAction(reward, observation)
+#    reward = p.act(action)
+#    
+#==============================================================================
 #img = p.getScreenGrayscale()
-pygame.quit()
-# -*- coding: utf-8 -*-
-
 
 #print (in_arr[0][1][0])
